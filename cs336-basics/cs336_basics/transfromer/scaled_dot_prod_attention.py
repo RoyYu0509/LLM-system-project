@@ -1,8 +1,8 @@
 import torch
-from jaxtyping import Float, Array
-from torch import Tensor
-from einops import rearrange, reduce, repeat, einsum
 import torch.cuda.nvtx as nvtx
+from einops import einsum
+from jaxtyping import Float
+from torch import Tensor
 
 
 def softmax(input: torch.Tensor, axis: int = -1):
@@ -23,6 +23,7 @@ def softmax(input: torch.Tensor, axis: int = -1):
     softmax_output = exp_x / sum_exp
 
     return softmax_output
+
 
 @nvtx.range("scaled dot product attention")
 def scaled_dot_product_attention(query, key, value, is_causal: bool = False):
@@ -61,16 +62,86 @@ def scaled_dot_product_attention(query, key, value, is_causal: bool = False):
 
     return attention
 
+
 ####################################################################
 # Add Different FlashAttention Kernels 
 ####################################################################
 
 from cs336_systems.FlashAttention.flash_attention_torch_vectorized import vectorized_attn_torch_fn
+
+
 @nvtx.range("Vectorized-Attention-Torch")
 def vectorized_attention_torch(query, key, value, is_causal: bool = False):
     return vectorized_attn_torch_fn(query, key, value, is_causal)  # Positional args only
 
-from cs336_systems.FlashAttention.flash_attention_triton import flash_attn_triton_fn
+
+try:
+    from cs336_systems.FlashAttention.flash_attention_triton import flash_attn_triton_fn
+    _TRITON_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - depends on local Triton install
+    flash_attn_triton_fn = None
+    _TRITON_IMPORT_ERROR = exc
+
+
 @nvtx.range("FlashAttention-MyTriton")
 def flash_attention_my_triton(query, key, value, is_causal: bool = False):
+    if flash_attn_triton_fn is None:
+        raise RuntimeError(
+            "FlashAttention-2 Triton kernel is unavailable in this environment."
+        ) from _TRITON_IMPORT_ERROR
     return flash_attn_triton_fn(query, key, value, is_causal)  # Positional args only
+
+
+from cs336_systems.FlashAttention.flash_attention_torch_naive import flash_attn_torch_fn
+
+
+@nvtx.range("FlashAttention-PyTorch")
+def flash_attention_pytorch(query, key, value, is_causal: bool = False):
+    return flash_attn_torch_fn(query, key, value, is_causal)
+
+
+ATTENTION_KERNELS = {
+    "scaled_dot_prod_attention": scaled_dot_product_attention,
+    "FlashAttention-2 PyTorch": flash_attention_pytorch,
+    "Vectorized Torch": vectorized_attention_torch,
+    "FlashAttention-2 Triton": flash_attention_my_triton,
+}
+
+
+# Keep backward compatibility with existing scripts.
+ATTENTION_KERNEL_ALIASES = {
+    "naive attention": "scaled_dot_prod_attention",
+    "scaled_dot_product_attention": "scaled_dot_prod_attention",
+    "comptorch": "Vectorized Torch",
+    "mytriton": "FlashAttention-2 Triton",
+    "flashattention-2 pytorch": "FlashAttention-2 PyTorch",
+    "flashattention-2 triton": "FlashAttention-2 Triton",
+    "vectortorch": "Vectorized Torch",
+    "vectorized_torch": "Vectorized Torch",
+    "vectorized torch": "Vectorized Torch",
+}
+
+
+def resolve_attention_kernel(kernel_name: str):
+    """Return (canonical_kernel_name, callable_attention_fn)."""
+    if kernel_name in ATTENTION_KERNELS:
+        return kernel_name, ATTENTION_KERNELS[kernel_name]
+
+    normalized = kernel_name.strip().lower()
+    canonical = ATTENTION_KERNEL_ALIASES.get(normalized)
+    if canonical is None:
+        supported = sorted(
+            list(ATTENTION_KERNELS.keys())
+            + ["Naive Attention", "CompTorch", "MyTriton"]
+        )
+        raise ValueError(
+            f"Unknown attention kernel '{kernel_name}'. Supported values: {supported}"
+        )
+    return canonical, ATTENTION_KERNELS[canonical]
+
+
+def attention_kernel_choices(include_aliases: bool = True) -> list[str]:
+    choices = list(ATTENTION_KERNELS.keys())
+    if include_aliases:
+        choices += ["Naive Attention", "CompTorch", "MyTriton"]
+    return choices

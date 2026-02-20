@@ -56,7 +56,8 @@ uv run python ./cs336-basics/cs336_basics/trainer.py \
     --DEVICE "cuda" \
     --COMPILE \
     --EVAL_INTERVAL 100 \
-    --SAVE_INTERVAL 200 
+    --SAVE_INTERVAL 200 \
+    --CHECKPOINTING_EVERY 200
 ```
 
 
@@ -79,4 +80,13 @@ uv run python ./cs336-basics/cs336_basics/text_gen.py \
     --num-heads 16 \
     --d-ff 1344 \
     --rope-theta 10000
+```
+
+# 5. Full CUDA Pipeline (Assignment 2 integration)
+```
+uv run python ./cs336_systems/experiments/run_pipeline.py \
+    --config ./cs336_systems/experiments/default_pipeline_config.json \
+    --override training.attention_kernel="FlashAttention-2 Triton" \
+    --override training.ddp_wrapper="none" \
+    --override training.CHECKPOINTING_EVERY=200
 ```

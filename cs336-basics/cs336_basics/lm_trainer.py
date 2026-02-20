@@ -13,6 +13,10 @@ from cs336_basics.train.checkpointing import save_checkpoint_and_log
 from cs336_basics.train.data_loader import data_loading
 from cs336_basics.train.loss import cross_entropy, perplexity
 from cs336_basics.train.optimizer import AdamW, grad_clip, lr_scheduler
+from cs336_basics.transfromer.scaled_dot_prod_attention import (
+    attention_kernel_choices,
+    resolve_attention_kernel,
+)
 
 DTYPE_DICT = {
     "float32": torch.float32,
@@ -45,6 +49,13 @@ def build_trainer_parser() -> argparse.ArgumentParser:
     parser.add_argument("--NUM_HEADS", type=int, default=16, help="Attention head count.")
     parser.add_argument("--D_FF", type=int, default=1_344, help="Point-wise FFN hidden size.")
     parser.add_argument("--ROPE_THETA", type=float, default=10_000.0, help="RoPE theta parameter.")
+    parser.add_argument(
+        "--ATTENTION_KERNEL",
+        type=str,
+        default="scaled_dot_prod_attention",
+        choices=attention_kernel_choices(include_aliases=True),
+        help="Attention kernel implementation.",
+    )
 
     # Optimization settings.
     parser.add_argument("--LR", type=float, default=3e-4, help="AdamW learning rate.")
@@ -67,6 +78,12 @@ def build_trainer_parser() -> argparse.ArgumentParser:
     parser.add_argument("--LOG_INTERVAL", type=int, default=50, help="Steps between training log prints.")
     parser.add_argument("--EVAL_INTERVAL", type=int, default=500, help="Steps between validation runs.")
     parser.add_argument("--SAVE_INTERVAL", type=int, default=1_000, help="Steps between checkpoint saves.")
+    parser.add_argument(
+        "--CHECKPOINTING_EVERY",
+        type=int,
+        default=None,
+        help="Checkpoint cadence override. If set, overrides SAVE_INTERVAL. <=0 disables periodic checkpoints.",
+    )
     parser.add_argument("--SEED", type=int, default=0, help="Random seed.")
     return parser
 
@@ -86,6 +103,41 @@ def _load_np_tokens(path: str, device: str) -> torch.Tensor:
     return tensor
 
 
+def resolve_checkpointing_every(save_interval: int, checkpointing_every: int | None) -> int | None:
+    """Resolve checkpoint cadence with override precedence."""
+    cadence = save_interval if checkpointing_every is None else checkpointing_every
+    if cadence <= 0:
+        return None
+    return cadence
+
+
+def should_save_checkpoint(
+    iteration: int,
+    total_iterations: int,
+    checkpointing_every: int | None,
+) -> bool:
+    """Return True when a checkpoint should be saved at `iteration`."""
+    if iteration == total_iterations - 1:
+        return True
+    if checkpointing_every is None:
+        return False
+    return iteration != 0 and iteration % checkpointing_every == 0
+
+
+def planned_checkpoint_steps(
+    total_iterations: int,
+    save_interval: int,
+    checkpointing_every: int | None,
+) -> list[int]:
+    """Pure helper for tests/documentation of checkpoint cadence behavior."""
+    cadence = resolve_checkpointing_every(save_interval, checkpointing_every)
+    steps = []
+    for step in range(total_iterations):
+        if should_save_checkpoint(step, total_iterations, cadence):
+            steps.append(step)
+    return steps
+
+
 def train_lm(
     TRAIN_PATH: str,
     VAL_PATH: str,
@@ -102,6 +154,7 @@ def train_lm(
     NUM_HEADS: int = 16,
     D_FF: int = 1_344,
     ROPE_THETA: float = 10_000.0,
+    ATTENTION_KERNEL: str = "scaled_dot_prod_attention",
     LR: float = 3e-4,
     WEIGHT_DECAY: float = 0.01,
     BETA1: float = 0.9,
@@ -118,6 +171,7 @@ def train_lm(
     LOG_INTERVAL: int = 50,
     EVAL_INTERVAL: int = 500,
     SAVE_INTERVAL: int = 1_000,
+    CHECKPOINTING_EVERY: int | None = None,
     SEED: int = 0,
     WANDB_PROJECT: str | None = None,
     WANDB_RUN_NAME: str | None = None,
@@ -144,6 +198,7 @@ def train_lm(
         NUM_HEADS: number of attention heads.
         D_FF: FFN hidden size.
         ROPE_THETA: RoPE theta value.
+        ATTENTION_KERNEL: selected attention kernel implementation.
         LR: max learning rate for schedule.
         WEIGHT_DECAY: AdamW weight decay.
         BETA1: AdamW beta1.
@@ -160,6 +215,7 @@ def train_lm(
         LOG_INTERVAL: steps between train-loss prints.
         EVAL_INTERVAL: steps between validation runs.
         SAVE_INTERVAL: steps between checkpoint saves.
+        CHECKPOINTING_EVERY: if set, overrides SAVE_INTERVAL. <=0 disables periodic saves.
         SEED: random seed.
         WANDB_PROJECT: Weights & Biases project name (required).
         WANDB_RUN_NAME: optional run name override.
@@ -175,6 +231,8 @@ def train_lm(
         raise RuntimeError("Provide a WanDB Project to log the results.")
 
     torch.manual_seed(SEED)
+    resolved_kernel_name, attention_fn = resolve_attention_kernel(ATTENTION_KERNEL)
+    periodic_checkpoint_every = resolve_checkpointing_every(SAVE_INTERVAL, CHECKPOINTING_EVERY)
     betas = (BETA1, BETA2)
     torch_dtype = DTYPE_DICT[DTYPE]
     # Use the legacy naming scheme so old experiments/checkpoint folders look familiar.
@@ -196,6 +254,7 @@ def train_lm(
         ROPE_THETA,
         device=DEVICE,
         dtype=torch_dtype,
+        attention_fn=attention_fn,
     )
 
     # 2) Optionally compile for backend-specific speedups.
@@ -260,7 +319,10 @@ def train_lm(
             group["lr"] = lr
 
         if iteration % LOG_INTERVAL == 0:
-            print(f"Iter:{iteration} | Training Loss: {tr_loss}")
+            print(
+                f"Iter:{iteration} | Training Loss: {tr_loss} | "
+                f"Attention Kernel: {resolved_kernel_name}"
+            )
 
         # 8) Run periodic validation and log to W&B.
         if iteration % EVAL_INTERVAL == 0:
@@ -290,7 +352,7 @@ def train_lm(
                 )
 
         # 9) Save checkpoints periodically (and always at the final iteration).
-        if (iteration != 0 and iteration % SAVE_INTERVAL == 0) or iteration == EPOCHES - 1:
+        if should_save_checkpoint(iteration, EPOCHES, periodic_checkpoint_every):
             with torch.no_grad():
                 val_loss = 0.0
                 for _ in range(VAL_SAMP_SIZE):

@@ -64,6 +64,51 @@ code's dependencies, run tests, and create a gzipped tarball with the output. We
 should be able to unzip your submitted tarball and run
 `./test_and_make_submission.sh` to verify your test results.
 
+## Experiments Pipeline (CUDA-only)
+
+The repo now includes a config-driven pipeline and benchmark scripts under
+`cs336_systems/experiments`.
+
+### 1. End-to-end pipeline
+
+Runs data routing (`tinystories/local_text/local_npy/auto`), tokenizer/data
+build (when needed), and LM training with kernel/wrapper selection:
+
+```sh
+uv run python cs336_systems/experiments/run_pipeline.py \
+  --config cs336_systems/experiments/default_pipeline_config.json \
+  --override training.attention_kernel=\"FlashAttention-2 Triton\" \
+  --override training.ddp_wrapper=\"none\" \
+  --override training.CHECKPOINTING_EVERY=200
+```
+
+Notes:
+- `training.CHECKPOINTING_EVERY` overrides `training.SAVE_INTERVAL`.
+- `CHECKPOINTING_EVERY <= 0` disables periodic checkpoints and still saves the final checkpoint.
+- Distributed training is used only when `ddp_wrapper` is `naive` or `flashddp` and `torch.cuda.device_count() > 1`.
+
+### 2. LM matrix benchmark (4 kernels x 2 wrappers)
+
+Produces local `CSV + PNG + Markdown` artifacts:
+
+```sh
+uv run python cs336_systems/experiments/benchmark_lm_matrix.py \
+  --config cs336_systems/experiments/default_pipeline_config.json \
+  --output-dir artifacts/lm_matrix
+```
+
+### 3. Attention forward-only sweep benchmark
+
+Benchmarks square and rectangular `(Q_N, K_N)` tiers from Small to XXL:
+
+```sh
+uv run python cs336_systems/experiments/benchmark_attention_sweep.py \
+  --DTYPE float16 \
+  --output-dir artifacts/attention_sweep
+```
+
+Custom tiers use `NAME:BATCH:HEADS:Q_N:K_N:D` and all dimensions must be powers of 2.
+
 
 
 
